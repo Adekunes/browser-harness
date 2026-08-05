@@ -28,6 +28,14 @@ dependencies = [
     "websockets==15.0.1",
 ]
 
+# Dev tooling lives in the default `dev` group so `uv run pytest` resolves it
+# from the persistent project env, instead of building a fresh ephemeral overlay
+# venv on every cold cache.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
 [project.scripts]
 browser-harness = "browser_harness.run:main"
 
