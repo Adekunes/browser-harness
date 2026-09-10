@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# swarm-harness: run one swarm agent (or a control op) against the shared browser.
+#
+#   swarm-harness up            # preflight: ensure the shared :9333 Chrome is up
+#   swarm-harness <id> <<'PY'   # run an agent under BU_NAME=swarm-<id>, own tab
+#   swarm-harness ctl <<'PY'    # control ops: swarm_status(), swarm_reap()
+#
+# Each agent gets its own daemon + socket + tmp dir (isolation), but binds to the
+# SAME browser via BU_CDP_URL (default :9333, override with BH_SWARM_CDP) so every
+# tab shares one logged-in session. All swarm daemons share one runtime dir so
+# `ctl` can discover and reap the whole fleet.
+set -euo pipefail
+
+# Resolve symlinks: this script is normally invoked through ~/.local/bin/swarm-harness,
+# and a bare dirname of BASH_SOURCE would set ROOT to ~/.local/bin instead of the repo,
+# which sends the uv fallback at the bottom to a directory with no browser_harness
+# package ("No module named 'browser_harness'").
+_SRC="${BASH_SOURCE[0]}"
+while [ -L "$_SRC" ]; do
+  _DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  case "$_SRC" in /*) ;; *) _SRC="$_DIR/$_SRC" ;; esac
+done
+ROOT="$(cd -P "$(dirname "$_SRC")" && pwd)"
+DEV_ID="$(printf '%s' "$ROOT" | cksum | awk '{print $1}')"
+
+ID="${1:-ctl}"
+shift || true
+case "$ID" in
+  ""|*[!A-Za-z0-9_-]*)
+    echo "invalid swarm id: $ID (allowed: A-Za-z0-9_-)" >&2
+    exit 2
+    ;;
+esac
+
+# --- `up`: pure-bash preflight, no daemon/python (works even when Chrome is down)
+if [ "$ID" = "up" ]; then
+  PORT="${BH_SWARM_PORT:-9333}"
+  VER_URL="http://127.0.0.1:$PORT/json/version"
+  if curl -s --max-time 2 "$VER_URL" >/dev/null 2>&1; then
+    echo "swarm: shared Chrome already up on :$PORT"
+    exit 0
+  fi
+  # Agent fleet runs on the SEPARATE Chrome Beta bundle, never Abdul's daily Chrome (2026-09-09).
+  APP="/Applications/Google Chrome Beta.app"
+  CHROME="$APP/Contents/MacOS/Google Chrome Beta"
+  PROFILE="${BH_SWARM_PROFILE:-$HOME/ChromeAgent}"
+  if [ ! -x "$CHROME" ]; then
+    echo "swarm: Chrome not found at '$CHROME'." >&2
+    echo "       Launch it yourself: '<chrome>' --remote-debugging-port=$PORT --user-data-dir='$PROFILE'" >&2
+    exit 1
+  fi
+  echo "swarm: launching agent Chrome on :$PORT (profile: $PROFILE)"
+  open -g -na "$APP" --args --remote-debugging-port="$PORT" --user-data-dir="$PROFILE" \
+    --no-first-run --no-default-browser-check >/dev/null 2>&1 &
+  for _ in $(seq 1 30); do
+    if curl -s --max-time 1 "$VER_URL" >/dev/null 2>&1; then
+      echo "swarm: up on :$PORT"
+      exit 0
+    fi
+    sleep 0.5
+  done
+  echo "swarm: timed out waiting for :$PORT to answer" >&2
+  exit 1
+fi
+
+# --- `down`: reap agents, stop the ctl daemon, clear the swarm runtime dir
+if [ "$ID" = "down" ]; then
+  "$0" ctl <<'PY' 2>/dev/null || true
+try:
+    print("swarm:", swarm_reap())
+except Exception as e:
+    print("swarm: reap error:", e)
+PY
+  "$0" ctl <<'PY' 2>/dev/null || true
+from browser_harness.admin import restart_daemon
+restart_daemon()
+PY
+  rm -rf "/tmp/bh-swarm-$DEV_ID" 2>/dev/null || true
+  echo "swarm: down (agents reaped, ctl stopped, runtime cleared)"
+  exit 0
+fi
+
+# --- agent / control: isolate per-id, bind to the shared browser
+export BU_NAME="swarm-$ID"
+# BH_SWARM_CDP wins (e.g. a VPS ws), else inherit any BU_CDP_URL, else :9333.
+export BU_CDP_URL="${BH_SWARM_CDP:-${BU_CDP_URL:-http://127.0.0.1:9333}}"
+export BH_HOME="${BH_HOME:-$ROOT/.browser-harness-dev}"
+# Load THIS repo's swarm helpers regardless of BH_HOME.
+export BH_AGENT_WORKSPACE="$ROOT/agent-workspace"
+
+BASE="/tmp/bh-swarm-$DEV_ID"
+export BH_RUNTIME_DIR="$BASE/runtime"   # shared across the fleet -> ctl can discover all
+export BH_RUNTIME_DIR_SHARED=1          # so sockets carry the bu-swarm-<id> name
+export BH_TMP_DIR="$BASE/tmp/$ID"       # per-agent -> no shot.png / overlay collisions
+mkdir -p "$BH_RUNTIME_DIR" "$BH_TMP_DIR"
+
+if [ -x "$ROOT/.venv/bin/python" ]; then
+  exec "$ROOT/.venv/bin/python" -m browser_harness.run "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+  exec uv --directory "$ROOT" run python -m browser_harness.run "$@"
+fi
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m browser_harness.run "$@"
