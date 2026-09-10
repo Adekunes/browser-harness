@@ -421,6 +421,28 @@ class _PatientCDPClient(CDPClient):
         self._message_handler_task = asyncio.create_task(self._handle_messages())
 
 
+def _conn_dead(e):
+    """True when an exception from send_raw means the CDP websocket is gone.
+
+    cdp_use surfaces a drop three ways: ConnectionError('WebSocket connection
+    closed') / ('Client is stopping') when a pending future is failed, a bare
+    RuntimeError('Client is not started') when self.ws was already None, and a
+    websockets ConnectionClosed raised straight out of ws.send(). We match by
+    type where we can and fall back to message text so a websockets version
+    bump can't silently drop the ConnectionClosed case."""
+    if isinstance(e, ConnectionError):
+        return True
+    if "ConnectionClosed" in type(e).__name__:
+        return True
+    msg = str(e)
+    return (
+        "WebSocket connection closed" in msg
+        or "Client is not started" in msg
+        or "Client is stopping" in msg
+        or "no close frame received" in msg
+    )
+
+
 class Daemon:
     def __init__(self):
         self.cdp = None
@@ -438,6 +460,9 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        # Serializes CDP-client rebuilds so concurrent handlers that all see the
+        # same dropped websocket don't each spin up a fresh connection.
+        self._reconnect_lock = asyncio.Lock()
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -632,8 +657,20 @@ class Daemon:
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(self.session)
 
-    async def start(self):
-        self.stop = asyncio.Event()
+    def _install_tap(self):
+        """Wrap the current CDP client's event dispatch so the daemon mirrors
+        events into its buffer, tracks dialogs, and re-marks tab titles. Must be
+        re-run against every fresh CDP client (each has its own event registry),
+        so it lives here rather than inline in start()."""
+        orig = self.cdp._event_registry.handle_event
+        async def tap(method, params, session_id=None):
+            self._record_event(method, params, session_id)
+            return await orig(method, params, session_id)
+        self.cdp._event_registry.handle_event = tap
+
+    async def _connect_cdp(self):
+        """Build the CDP client, connect the websocket, attach a page, and install
+        the event tap. Shared by initial start() and reconnect()."""
         url = get_ws_url()
         log(f"connecting to {_safe_connection_label(url)}")
         self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
@@ -656,11 +693,27 @@ class Daemon:
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
         await self.attach_first_page()
-        orig = self.cdp._event_registry.handle_event
-        async def tap(method, params, session_id=None):
-            self._record_event(method, params, session_id)
-            return await orig(method, params, session_id)
-        self.cdp._event_registry.handle_event = tap
+        self._install_tap()
+
+    async def _reconnect(self, failed_cdp):
+        """Rebuild the CDP connection after the websocket dropped.
+
+        `failed_cdp` is the client the caller saw fail. Under the lock we bail if
+        someone already swapped in a live client, so only the first failing
+        handler rebuilds and the rest reuse the result. For a local Chrome,
+        get_ws_url() re-resolves the live websocket, so this also recovers from a
+        Chrome restart. For a remote BU_CDP_WS the URL is fixed; if that endpoint
+        is gone the rebuild raises and the original error is returned."""
+        async with self._reconnect_lock:
+            if self.cdp is not failed_cdp:
+                return
+            log("CDP websocket dropped, reconnecting")
+            await _silent(failed_cdp.stop())
+            await self._connect_cdp()
+
+    async def start(self):
+        self.stop = asyncio.Event()
+        await self._connect_cdp()
 
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
@@ -805,6 +858,23 @@ class Daemon:
                             return {"error": str(retry_error)}
                 finally:
                     self._finish_recovery(recovery_task)
+            if _conn_dead(e):
+                # Websocket dropped (Chrome closed/restarted, remote hiccup).
+                # Rebuild the connection and retry once. After a rebuild every
+                # prior session id is void, so a non-Target call runs on the
+                # freshly attached default session rather than the stale id the
+                # caller computed client-side.
+                failed = self.cdp
+                try:
+                    await self._reconnect(failed)
+                except Exception as reconnect_error:
+                    log(f"reconnect failed: {reconnect_error}")
+                    return {"error": f"{msg} -- CDP reconnect failed: {reconnect_error}"}
+                retry_sid = None if method.startswith("Target.") else self.session
+                try:
+                    return {"result": await self.cdp.send_raw(method, params, session_id=retry_sid)}
+                except Exception as retry_error:
+                    return {"error": str(retry_error)}
             return {"error": msg}
 
 

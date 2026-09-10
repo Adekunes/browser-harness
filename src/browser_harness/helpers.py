@@ -38,8 +38,25 @@ _load_env()
 NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
+def _env_seconds(name, default):
+    """Read a float seconds value from the environment, ignoring garbage."""
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return default
+
+
 IPC_CONNECT_TIMEOUT_SECONDS = 5.0
-DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = 5.0
+# Establishing the socket to a local daemon is instant, so the connect budget
+# stays short. The response budget is different: it covers a full CDP round trip
+# to Chrome, and heavy DOM reads, awaited promises and slow navigations routinely
+# need more than a few seconds. A 5s response budget turned every slow-but-valid
+# call into a hard failure, so the default is 30s, tunable per machine with
+# BH_CMD_TIMEOUT and per call with cdp(_response_timeout=) / js(timeout=).
+DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = _env_seconds("BH_CMD_TIMEOUT", 30.0)
 # Cloud screenshots routinely take longer than ordinary CDP round trips. Keep
 # their IPC socket alive within the caller's existing 90-second process budget.
 SCREENSHOT_IPC_RESPONSE_TIMEOUT_SECONDS = 60.0
@@ -132,9 +149,10 @@ def _runtime_value(response, expression):
     return None
 
 
-def _runtime_evaluate(expression, session_id=None, await_promise=False):
+def _runtime_evaluate(expression, session_id=None, await_promise=False, timeout=None):
     try:
-        r = cdp("Runtime.evaluate", session_id=session_id, expression=expression, returnByValue=True, awaitPromise=await_promise)
+        r = cdp("Runtime.evaluate", session_id=session_id, expression=expression, returnByValue=True, awaitPromise=await_promise,
+                _response_timeout=timeout if timeout is not None else DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS)
     except TimeoutError as e:
         raise RuntimeError(f"Runtime.evaluate timed out; expression: {_js_snippet(expression)}") from e
     return _runtime_value(r, expression)
@@ -558,8 +576,12 @@ def wait_for_network_idle(timeout=10.0, idle_ms=500):
         time.sleep(0.1)
     return False
 
-def js(expression, target_id=None):
+def js(expression, target_id=None, timeout=None):
     """Run JS in the attached tab (default) or inside an iframe target (via iframe_target()).
+
+    `timeout` overrides the IPC response budget in seconds for this call only
+    (default DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, env BH_CMD_TIMEOUT). Raise it
+    for an expression that awaits something genuinely slow.
 
     Expressions are evaluated as-is first. If Chrome reports an illegal top-level
     `return`, the snippet is retried inside a function wrapper, so both
@@ -568,7 +590,7 @@ def js(expression, target_id=None):
     """
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     try:
-        result = _js_evaluate(expression, sid)
+        result = _js_evaluate(expression, sid, timeout)
     except BaseException:
         # Keep the evaluation error; a detach failure here must not replace it.
         if sid:
@@ -582,12 +604,12 @@ def js(expression, target_id=None):
     return result
 
 
-def _js_evaluate(expression, sid):
+def _js_evaluate(expression, sid, timeout=None):
     try:
-        return _runtime_evaluate(expression, session_id=sid, await_promise=True)
+        return _runtime_evaluate(expression, session_id=sid, await_promise=True, timeout=timeout)
     except RuntimeError as e:
         if _is_illegal_return_error(e):
-            return _runtime_evaluate(_wrap_js_function(expression), session_id=sid, await_promise=True)
+            return _runtime_evaluate(_wrap_js_function(expression), session_id=sid, await_promise=True, timeout=timeout)
         raise
 
 
