@@ -671,7 +671,12 @@ class Daemon:
     async def _connect_cdp(self):
         """Build the CDP client, connect the websocket, attach a page, and install
         the event tap. Shared by initial start() and reconnect()."""
-        url = get_ws_url()
+        # get_ws_url() polls /json/version with blocking urlopen + time.sleep for
+        # up to 30 s. Run it off the event loop so meta:ping keeps answering while
+        # Chrome is down or slow to start; otherwise ensure_daemon() reads the
+        # silence as "no daemon", spawns a sibling without signalling this one,
+        # and this process is left running forever on an unlinked socket.
+        url = await asyncio.to_thread(get_ws_url)
         log(f"connecting to {_safe_connection_label(url)}")
         self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
         if BROWSER_KIND == "local":
@@ -899,6 +904,7 @@ async def serve(d):
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
+    _publish_own_pid()  # the socket is ours now; the pid record must say so (see _exit_when_superseded)
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -933,10 +939,39 @@ async def serve(d):
         ipc.cleanup_endpoint(NAME)
 
 
+async def _exit_when_superseded(d, every=5.0):
+    """Stop this daemon once another process owns NAME.
+
+    ipc.serve() unlinks and rebinds the socket path unconditionally, so a
+    sibling that starts while this daemon is busy takes the name over silently
+    and this process becomes unreachable but never exits. The pid record is
+    the ownership ledger: the moment it names another live pid, step aside."""
+    me = os.getpid()
+    while not d.stop.is_set():
+        await asyncio.sleep(every)
+        try:
+            raw = Path(PID).read_text()
+            try:
+                owner = int(json.loads(raw)["pid"])
+            except (json.JSONDecodeError, TypeError, KeyError):
+                owner = int(raw.split()[0])
+        except (FileNotFoundError, OSError, ValueError, IndexError):
+            continue  # no record: a --reload in progress, let it finish
+        if owner != me:
+            log(f"superseded by pid {owner}, exiting")
+            d._shutting_down = True
+            d.stop.set()
+            return
+
+
 async def main():
     d = Daemon()
     await d.start()
-    await serve(d)
+    watchdog = asyncio.create_task(_exit_when_superseded(d))
+    try:
+        await serve(d)
+    finally:
+        watchdog.cancel()
 
 
 def already_running():
