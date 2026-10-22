@@ -738,3 +738,18 @@ def test_js_keeps_base_exception_from_evaluation_when_detach_also_raises():
         KeyboardInterrupt, match="evaluation interrupted"
     ):
         helpers.js("7", target_id="iframe-target")
+
+
+def test_handle_dialog_accepts_with_prompt_text():
+    calls = []
+    with patch("browser_harness.helpers._send", return_value={"dialog": {"type": "prompt", "message": "Name?"}}), \
+         patch("browser_harness.helpers.cdp", side_effect=lambda m, **kw: calls.append((m, kw))):
+        assert helpers.handle_dialog(text="Ada")["type"] == "prompt"
+    assert calls == [("Page.handleJavaScriptDialog", {"accept": True, "promptText": "Ada"})]
+
+
+def test_handle_dialog_noop_without_dialog():
+    with patch("browser_harness.helpers._send", return_value={"dialog": None}), \
+         patch("browser_harness.helpers.cdp") as cdp:
+        assert helpers.handle_dialog() is None
+    cdp.assert_not_called()

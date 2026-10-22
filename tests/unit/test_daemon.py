@@ -845,3 +845,39 @@ def test_explicit_stale_session_is_not_redirected():
     assert d.cdp.calls == [
         ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
     ]
+
+
+class _BlockingCDP(_FakeCDP):
+    async def send_raw(self, method, params=None, session_id=None):
+        self.calls.append((method, params, session_id))
+        await asyncio.Event().wait()  # hangs like a CDP call on a page frozen by alert()
+
+
+def _blocked_by_dialog(method):
+    d = daemon.Daemon()
+    d.cdp = _BlockingCDP()
+    d.session = "s1"
+
+    async def go():
+        async def open_dialog():
+            await asyncio.sleep(0.05)
+            d._record_event("Page.javascriptDialogOpening", {"type": "confirm", "message": "Sure?"})
+        asyncio.ensure_future(open_dialog())
+        return await d.handle({"method": method, "params": {}})
+    return asyncio.run(go())
+
+
+def test_input_call_returns_once_it_opens_a_dialog():
+    assert _blocked_by_dialog("Input.dispatchMouseEvent") == {"result": {}}
+
+
+def test_other_calls_blocked_by_dialog_get_actionable_error():
+    r = _blocked_by_dialog("Runtime.evaluate")
+    assert "confirm dialog 'Sure?'" in r["error"] and "handle_dialog" in r["error"]
+
+
+def test_dialog_closed_event_clears_blocked_state():
+    d = _fresh_daemon()
+    d._record_event("Page.javascriptDialogOpening", {"type": "alert", "message": "hi"})
+    d._record_event("Page.javascriptDialogClosed", {})
+    assert d.dialog is None and not d.dialog_open.is_set()

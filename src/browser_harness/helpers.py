@@ -193,6 +193,14 @@ def click_at_xy(x, y, button="left", clicks=1):
     cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
     cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
 
+def handle_dialog(accept=True, text=None):
+    """Accept or dismiss an open alert/confirm/prompt/beforeunload; `text` answers a prompt().
+    Returns the dialog ({type, message, ...}) or None if none was open."""
+    dialog = _send({"meta": "pending_dialog"}).get("dialog")
+    if dialog:
+        cdp("Page.handleJavaScriptDialog", accept=accept, **({} if text is None else {"promptText": text}))
+    return dialog
+
 def type_text(text):
     cdp("Input.insertText", text=text)
 

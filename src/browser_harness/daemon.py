@@ -437,6 +437,7 @@ class Daemon:
         self._session_replacements = {}
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        self.dialog_open = asyncio.Event()
         self.stop = None  # asyncio.Event, set inside start()
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
@@ -627,8 +628,10 @@ class Daemon:
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
+            self.dialog_open.set()
         elif method == "Page.javascriptDialogClosed":
             self.dialog = None
+            self.dialog_open.clear()
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(self.session)
 
@@ -661,6 +664,22 @@ class Daemon:
             self._record_event(method, params, session_id)
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
+
+    async def send_unless_dialog(self, method, params, session_id):
+        """send_raw, but give up ~1s after a JS dialog opens: the page is frozen and the
+        call would otherwise hang until the dialog closes. Returns None when blocked."""
+        call = asyncio.ensure_future(self.cdp.send_raw(method, params, session_id=session_id))
+        opened = asyncio.ensure_future(self.dialog_open.wait())
+        try:
+            await asyncio.wait({call, opened}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            opened.cancel()
+        if not call.done():
+            await asyncio.wait({call}, timeout=1)
+        if call.done():
+            return call.result()
+        call.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return None
 
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
@@ -766,7 +785,14 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.send_unless_dialog(method, params, sid)
+            if result is not None:
+                return {"result": result}
+            if method.startswith("Input."):  # the input landed; it is what opened the dialog
+                return {"result": {}}
+            d = self.dialog or {}
+            return {"error": f"blocked by an open JavaScript {d.get('type', '')} dialog {d.get('message', '')!r} -- "
+                             "call handle_dialog(accept=True) or handle_dialog(accept=False) first"}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid:

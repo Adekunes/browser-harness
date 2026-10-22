@@ -11,6 +11,14 @@ Browser dialogs (`alert`, `confirm`, `prompt`, `beforeunload`) freeze the JS thr
 Works even when JS is frozen. Handles all dialog types including `beforeunload`.
 
 ```python
+handle_dialog(accept=True)              # OK / Leave; returns {type, message, ...} or None
+handle_dialog(accept=False)             # Cancel / Stay
+handle_dialog(text="Ada")               # answer a prompt()
+```
+
+While a dialog is open, other calls fail fast with `blocked by an open JavaScript ... dialog` instead of timing out. The raw CDP equivalent:
+
+```python
 # Dismiss and read the message
 cdp("Page.handleJavaScriptDialog", accept=True)   # accept / click OK
 cdp("Page.handleJavaScriptDialog", accept=False)  # cancel / click Cancel
