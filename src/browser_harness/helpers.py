@@ -450,6 +450,21 @@ def new_tab(url="about:blank"):
         goto_url(url)
     return tid
 
+def switch_to_new_tab(timeout=5.0):
+    """Switch to a tab the current tab opened (target=_blank link, window.open) and return it.
+    Clicking such a link leaves the agent on the old tab; call this right after. None on timeout."""
+    me = current_tab()["targetId"]
+    deadline = time.time() + timeout
+    while True:
+        opened = [t for t in cdp("Target.getTargets")["targetInfos"] if t["type"] == "page" and t.get("openerId") == me]
+        if opened:
+            switch_tab(opened[-1]["targetId"])
+            wait_for_load()
+            return current_tab()
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
+
 def close_tab(target=None):
     """Close a tab. If `target` is omitted, closes the currently attached tab.
     Accepts a raw targetId string or a dict from list_tabs()/current_tab()."""

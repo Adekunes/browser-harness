@@ -738,3 +738,24 @@ def test_js_keeps_base_exception_from_evaluation_when_detach_also_raises():
         KeyboardInterrupt, match="evaluation interrupted"
     ):
         helpers.js("7", target_id="iframe-target")
+
+
+def test_switch_to_new_tab_picks_tab_opened_by_current():
+    targets = {"targetInfos": [
+        {"type": "page", "targetId": "other", "openerId": "x"},
+        {"type": "page", "targetId": "child", "openerId": "me"},
+    ]}
+    with patch("browser_harness.helpers.current_tab", side_effect=[{"targetId": "me"}, {"targetId": "child"}]), \
+         patch("browser_harness.helpers.cdp", return_value=targets), \
+         patch("browser_harness.helpers.switch_tab") as sw, \
+         patch("browser_harness.helpers.wait_for_load"):
+        assert helpers.switch_to_new_tab()["targetId"] == "child"
+    sw.assert_called_once_with("child")
+
+
+def test_switch_to_new_tab_returns_none_on_timeout():
+    with patch("browser_harness.helpers.current_tab", return_value={"targetId": "me"}), \
+         patch("browser_harness.helpers.cdp", return_value={"targetInfos": []}), \
+         patch("browser_harness.helpers.switch_tab") as sw:
+        assert helpers.switch_to_new_tab(timeout=0) is None
+    sw.assert_not_called()
