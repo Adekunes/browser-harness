@@ -40,6 +40,27 @@ chrome://inspect/#remote-debugging
 
 Ask the user to tick "Allow remote debugging for this browser instance" and click Allow if Chrome shows a permission popup. Then retry the same `browser-harness` command.
 
+## Own Browser Per Agent
+
+For parallel sub-agents, or a machine with no Chrome open (servers, containers), give each agent its own private Chrome. Set `BH_LAUNCH_BROWSER=1` and a unique `BU_NAME` on every call; the first call launches a headless Chrome with a temp profile, later calls reuse it:
+
+```bash
+BU_NAME=agent1 BH_LAUNCH_BROWSER=1 browser-harness <<'PY'
+new_tab("https://example.com")
+print(page_info())
+PY
+```
+
+Close it when done; this kills that Chrome and deletes its profile:
+
+```bash
+BU_NAME=agent1 browser-harness --reload
+```
+
+- Agents with different `BU_NAME`s share nothing: cookies, tabs, and focus are isolated.
+- It also closes on its own after `BH_IDLE_TIMEOUT` seconds without a call (default 1800).
+- `BH_HEADLESS=0` shows the window. `BH_CHROME_BIN` picks the binary if auto-detect fails.
+
 ## Remote Browsers
 
 Use Browser Use cloud for headless servers, parallel sub-agents, or isolated work.
@@ -86,6 +107,7 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 
 - Screenshots first: use `capture_screenshot()` to understand visible state.
 - Clicking: screenshot -> read pixel -> `click_at_xy(x, y)` -> screenshot again.
+- When you know a selector, `click(selector)` scrolls it into view and clicks its center. It raises if the element is missing, hidden, or covered (cookie banner, modal) instead of clicking blind.
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
@@ -127,6 +149,8 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 - Omnibox popups are not real work tabs.
 - CDP target order is not Chrome's visible tab-strip order.
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.
+- `click_at_xy` on an off-screen coordinate silently does nothing; scroll first or use `click(selector)`.
+- `AF_UNIX path too long`: set `BH_RUNTIME_DIR` to a short dir such as `/tmp/bh`.
 - Ask before leaving cloud browsers running; stop them with `stop_remote_daemon(name)` or `PATCH /browsers/{id} {"action":"stop"}`.
 
 ## Domain Skills

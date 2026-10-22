@@ -350,3 +350,38 @@ def test_wait_for_network_idle_filters_events_to_active_session():
         "session filter, the background rWS/lF pair would have updated "
         "last_activity and prevented the idle window from elapsing."
     )
+
+
+def _key_downs(key):
+    calls = []
+    with patch("browser_harness.helpers.cdp", side_effect=lambda m, **kw: calls.append(kw) or {}):
+        helpers.press_key(key)
+    return calls[0]
+
+
+@pytest.mark.parametrize("key,vk,code", [
+    ("a", 65, "KeyA"), ("A", 65, "KeyA"), ("7", 55, "Digit7"),
+    (".", 190, "."), ("'", 222, "'"), ("!", 49, "!"), ("\n", 13, "Enter"),
+])
+def test_press_key_uses_real_virtual_key_codes(key, vk, code):
+    d = _key_downs(key)
+    assert (d["windowsVirtualKeyCode"], d["code"]) == (vk, code)
+
+
+def test_click_scrolls_and_clicks_element_center():
+    clicks = []
+    with patch("browser_harness.helpers.js", return_value={"x": 10, "y": 20, "covered": None}), \
+         patch("browser_harness.helpers.click_at_xy", side_effect=lambda x, y: clicks.append((x, y))):
+        assert helpers.click("#go") == (10, 20)
+    assert clicks == [(10, 20)]
+
+
+@pytest.mark.parametrize("result,msg", [
+    (None, "not found"), ({"hidden": True}, "hidden"), ({"x": 1, "y": 2, "covered": "div#banner"}, "covered by <div#banner>"),
+])
+def test_click_raises_instead_of_clicking_blind(result, msg):
+    with patch("browser_harness.helpers.js", return_value=result), \
+         patch("browser_harness.helpers.click_at_xy") as click_at:
+        with pytest.raises(RuntimeError, match=msg):
+            helpers.click("#go")
+    click_at.assert_not_called()

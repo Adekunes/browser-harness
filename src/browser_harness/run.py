@@ -82,7 +82,7 @@ def _local_chrome_listening():
 # env with a cloud WebSocket URL, silently replacing the user's explicit endpoint
 # *and* billing them for a cloud browser they never asked for.
 def _explicit_cdp_configured():
-    return bool(os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS"))
+    return bool(os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BH_LAUNCH_BROWSER") == "1")
 
 
 def _cloud_auth_configured():

@@ -293,3 +293,15 @@ def test_current_tab_meta_returns_not_attached_when_no_target_id():
     assert result == {"error": "not_attached"}
     # No CDP call should have been issued.
     assert d.cdp.calls == []
+
+
+def test_enable_default_domains_applies_headless_ua_override():
+    d = _fresh_daemon()
+    d.ua = "Mozilla/5.0 Chrome/141.0.0.0"
+    asyncio.run(d._enable_default_domains("s1"))
+    assert ("Network.setUserAgentOverride", {"userAgent": d.ua}, "s1") in d.cdp.calls
+
+
+def test_chrome_binary_prefers_bh_chrome_bin(monkeypatch):
+    monkeypatch.setenv("BH_CHROME_BIN", "/opt/my/chrome")
+    assert daemon.chrome_binary() == "/opt/my/chrome"

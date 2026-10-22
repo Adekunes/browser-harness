@@ -171,6 +171,30 @@ def click_at_xy(x, y, button="left", clicks=1):
     cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
     cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
 
+def click(selector, timeout=0.0):
+    """Scroll the first element matching `selector` into view and click its center with real mouse events.
+
+    Raises RuntimeError if the element is missing or another element (cookie banner,
+    modal, sticky header) covers its center. Pass timeout>0 to wait for it first.
+    Returns the (x, y) that was clicked."""
+    if timeout > 0 and not wait_for_element(selector, timeout=timeout):
+        raise RuntimeError(f"click: element not found: {selector!r}")
+    r = js(
+        f"(()=>{{const e=document.querySelector({json.dumps(selector)});if(!e)return null;"
+        f"e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}});"
+        f"const b=e.getBoundingClientRect();if(!b.width&&!b.height)return {{hidden:true}};const x=b.x+b.width/2,y=b.y+b.height/2,h=document.elementFromPoint(x,y);"
+        f"const d=h&&!e.contains(h)?h.tagName.toLowerCase()+(h.id?'#'+h.id:'')+(h.className&&typeof h.className==='string'?'.'+h.className.trim().split(/\\s+/).join('.'):''):null;"
+        f"return {{x,y,covered:d}}}})()"
+    )
+    if not r:
+        raise RuntimeError(f"click: element not found: {selector!r}")
+    if r.get("hidden"):
+        raise RuntimeError(f"click: element has no size (hidden): {selector!r}")
+    if r["covered"]:
+        raise RuntimeError(f"click: {selector!r} is covered by <{r['covered']}> at ({r['x']:.0f}, {r['y']:.0f}) -- dismiss it first")
+    click_at_xy(r["x"], r["y"])
+    return r["x"], r["y"]
+
 def type_text(text):
     cdp("Input.insertText", text=text)
 
@@ -221,11 +245,21 @@ _KEYS = {  # key → (windowsVirtualKeyCode, code, text)
     "Home": (36, "Home", ""), "End": (35, "End", ""),
     "PageUp": (33, "PageUp", ""), "PageDown": (34, "PageDown", ""),
 }
+# US-layout virtual key codes for punctuation (plain, then shifted) and shifted digits.
+# Without these, ord(ch) collides with control keys: "." -> 46 (Delete), "'" -> 39 (ArrowRight).
+_PUNCT_VK = dict(zip(";=,-./`[\\]':+<_>?~{|}\")!@#$%^&*(",
+                     [186, 187, 188, 189, 190, 191, 192, 219, 220, 221, 222] * 2 + list(range(48, 58))))
 def press_key(key, modifiers=0):
     """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift.
     Special keys (Enter, Tab, Arrow*, Backspace, etc.) carry their virtual key codes
     so listeners checking e.keyCode / e.key all fire."""
-    vk, code, text = _KEYS.get(key, (ord(key[0]) if len(key) == 1 else 0, key, key if len(key) == 1 else ""))
+    if key == "\n": key = "Enter"
+    if key in _KEYS:
+        vk, code, text = _KEYS[key]
+    elif len(key) == 1 and key.isascii() and key.isalnum():
+        vk, code, text = ord(key.upper()), ("Digit" if key.isdigit() else "Key") + key.upper(), key
+    else:
+        vk, code, text = _PUNCT_VK.get(key, 0), key, key if len(key) == 1 else ""
     base = {"key": key, "code": code, "modifiers": modifiers, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
     shortcut_modifiers = modifiers & (1 | 2 | 4)  # Alt/Ctrl/Meta turn single keys into shortcuts.
     printable_char = len(key) == 1 and bool(text) and not shortcut_modifiers

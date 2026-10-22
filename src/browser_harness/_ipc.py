@@ -171,6 +171,9 @@ async def serve(name, handler):
         # umask 0o077 makes bind() create the socket as 0600 — no TOCTOU window before chmod.
         old_umask = os.umask(0o077)
         try: server = await asyncio.start_unix_server(handler, path=path)
+        except OSError as e:
+            if "too long" not in str(e): raise
+            raise OSError(f"socket path too long ({len(path)} chars): {path} -- set BH_RUNTIME_DIR to a short dir, e.g. /tmp/bh") from e
         finally: os.umask(old_umask)
         _server_token = None
         async with server: await asyncio.Event().wait()
