@@ -92,6 +92,9 @@ BROWSER_KIND = "cloud" if REMOTE_ID else ("cdp" if (os.environ.get("BU_CDP_WS") 
 # Seconds without an IPC request before the daemon exits (and closes a launched browser). 0 = never.
 IDLE_TIMEOUT = float(os.environ.get("BH_IDLE_TIMEOUT") or (1800 if LAUNCH else 0))
 _launched = None  # (Popen, user-data-dir) of the Chrome this daemon owns when BH_LAUNCH_BROWSER=1
+# BH_STEALTH=1 injects stealth.js (patches headless fingerprint tells: languages, SwiftShader WebGL) into every page.
+STEALTH_JS = (Path(__file__).with_name("stealth.js").read_text(encoding="utf-8")
+              if os.environ.get("BH_STEALTH") == "1" else None)
 
 
 def log(msg):
@@ -144,6 +147,11 @@ def chrome_binary():
     return next((c for c in cands if os.path.exists(c)), None)
 
 
+def _die_with_daemon():  # Linux: SIGTERM Chrome if the daemon is SIGKILLed, so no orphan browsers
+    import ctypes
+    ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
 def launch_browser():
     """Start a private Chrome (temp profile, free port) owned by this daemon; return its WS URL."""
     global _launched
@@ -158,7 +166,8 @@ def launch_browser():
         args.append("--headless=new")
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         args.append("--no-sandbox")  # Chrome refuses to start as root without it (containers)
-    proc = subprocess.Popen(args + ["about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(args + ["about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            preexec_fn=_die_with_daemon if sys.platform.startswith("linux") else None)
     _launched = (proc, data_dir)
     log(f"launched {exe} pid={proc.pid} profile={data_dir}")
     active = Path(data_dir) / "DevToolsActivePort"
@@ -285,7 +294,8 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
-        self.ua = None  # UA override for headless launched browsers (drops "HeadlessChrome")
+        self.ua = None  # Network.setUserAgentOverride params for headless launched browsers (drops "HeadlessChrome")
+        self.dialog_open = asyncio.Event()
         self.last_request = time.time()
 
     async def attach_first_page(self):
@@ -328,8 +338,10 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         tasks = [enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")]
+        if STEALTH_JS:
+            tasks.append(_silent(self.cdp.send_raw("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS}, session_id=session_id)))
         if self.ua:
-            tasks.append(_silent(self.cdp.send_raw("Network.setUserAgentOverride", {"userAgent": self.ua}, session_id=session_id)))
+            tasks.append(_silent(self.cdp.send_raw("Network.setUserAgentOverride", self.ua, session_id=session_id)))
         await asyncio.gather(*tasks)
 
     async def start(self):
@@ -348,8 +360,20 @@ class Daemon:
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
         if LAUNCH:
-            ua = (await self.cdp.send_raw("Browser.getVersion"))["userAgent"]
-            self.ua = ua.replace("HeadlessChrome/", "Chrome/") if "HeadlessChrome/" in ua else None
+            v = await self.cdp.send_raw("Browser.getVersion")
+            if "HeadlessChrome/" in v["userAgent"]:
+                full = v["product"].split("/")[-1]
+                brands = [{"brand": "Chromium", "version": full.split(".")[0]}, {"brand": "Not)A;Brand", "version": "24"}]
+                self.ua = {
+                    "userAgent": v["userAgent"].replace("HeadlessChrome/", "Chrome/"),
+                    # Without metadata the override empties navigator.userAgentData.brands, a strong tell.
+                    "userAgentMetadata": {
+                        "brands": brands, "fullVersionList": [{**b, "version": full} if b["brand"] == "Chromium" else b for b in brands],
+                        "platform": {"Darwin": "macOS", "Windows": "Windows"}.get(platform.system(), "Linux"),
+                        "platformVersion": "", "model": "", "mobile": False,
+                        "architecture": "arm" if platform.machine().lower() in ("arm64", "aarch64") else "x86",
+                    },
+                }
         await self.attach_first_page()
         orig = self.cdp._event_registry.handle_event
         mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
@@ -357,12 +381,30 @@ class Daemon:
             self.events.append({"method": method, "params": params, "session_id": session_id})
             if method == "Page.javascriptDialogOpening":
                 self.dialog = params
+                self.dialog_open.set()
             elif method == "Page.javascriptDialogClosed":
                 self.dialog = None
+                self.dialog_open.clear()
             elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
                 asyncio.create_task(_silent(asyncio.wait_for(self.cdp.send_raw("Runtime.evaluate", {"expression": mark_js}, session_id=self.session), timeout=2)))
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
+
+    async def send_unless_dialog(self, method, params, session_id):
+        """send_raw, but give up ~1s after a JS dialog opens: the page is frozen and the
+        call would otherwise hang until the dialog closes. Returns None when blocked."""
+        call = asyncio.ensure_future(self.cdp.send_raw(method, params, session_id=session_id))
+        opened = asyncio.ensure_future(self.dialog_open.wait())
+        try:
+            await asyncio.wait({call, opened}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            opened.cancel()
+        if not call.done():
+            await asyncio.wait({call}, timeout=1)
+        if call.done():
+            return call.result()
+        call.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return None
 
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
@@ -453,7 +495,14 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.send_unless_dialog(method, params, sid)
+            if result is not None:
+                return {"result": result}
+            if method.startswith("Input."):  # the input landed; it is what opened the dialog
+                return {"result": {}}
+            d = self.dialog or {}
+            return {"error": f"blocked by an open JavaScript {d.get('type', '')} dialog {d.get('message', '')!r} -- "
+                             "call handle_dialog(accept=True) or handle_dialog(accept=False) first"}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid == self.session and sid:

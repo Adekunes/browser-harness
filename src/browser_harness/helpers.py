@@ -171,21 +171,35 @@ def click_at_xy(x, y, button="left", clicks=1):
     cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
     cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
 
+_CLICK_JS = """(()=>{const s=%s;
+function find(root,frames){const e=root.querySelector(s);if(e)return [e,frames];
+for(const n of root.querySelectorAll('*')){
+if(n.shadowRoot){const r=find(n.shadowRoot,frames);if(r)return r}
+if(n.tagName==='IFRAME'){let d=null;try{d=n.contentDocument}catch(_){}if(d){const r=find(d,[...frames,n]);if(r)return r}}}
+return null}
+const f=find(document,[]);if(!f)return null;const [e,frames]=f;
+e.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+const b=e.getBoundingClientRect();if(!b.width&&!b.height)return {hidden:true};
+const lx=b.x+b.width/2,ly=b.y+b.height/2;let x=lx,y=ly;
+for(const fr of frames){const r=fr.getBoundingClientRect();x+=r.x+fr.clientLeft;y+=r.y+fr.clientTop}
+const h=e.getRootNode().elementFromPoint(lx,ly);
+const c=h&&!e.contains(h)?h.tagName.toLowerCase()+(h.id?'#'+h.id:'')+(typeof h.className==='string'&&h.className.trim()?'.'+h.className.trim().split(/\\s+/).join('.'):''):null;
+return {x,y,covered:c}})()"""
+
 def click(selector, timeout=0.0):
     """Scroll the first element matching `selector` into view and click its center with real mouse events.
 
-    Raises RuntimeError if the element is missing or another element (cookie banner,
-    modal, sticky header) covers its center. Pass timeout>0 to wait for it first.
-    Returns the (x, y) that was clicked."""
-    if timeout > 0 and not wait_for_element(selector, timeout=timeout):
-        raise RuntimeError(f"click: element not found: {selector!r}")
-    r = js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});if(!e)return null;"
-        f"e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}});"
-        f"const b=e.getBoundingClientRect();if(!b.width&&!b.height)return {{hidden:true}};const x=b.x+b.width/2,y=b.y+b.height/2,h=document.elementFromPoint(x,y);"
-        f"const d=h&&!e.contains(h)?h.tagName.toLowerCase()+(h.id?'#'+h.id:'')+(h.className&&typeof h.className==='string'?'.'+h.className.trim().split(/\\s+/).join('.'):''):null;"
-        f"return {{x,y,covered:d}}}})()"
-    )
+    Searches the page, then open shadow roots and same-origin iframes. Raises RuntimeError
+    if the element is missing, hidden, or covered by another element (cookie banner, modal,
+    sticky header). Pass timeout>0 to wait for late-rendered elements. Returns the (x, y) clicked.
+    For cross-origin iframes use iframe_target() + js(..., target_id=...)."""
+    deadline = time.time() + timeout
+    while not (r := js(_CLICK_JS % json.dumps(selector))) and time.time() < deadline:
+        time.sleep(0.3)
+    if r and not r.get("hidden"):
+        # Hover first, then re-measure: leaving a hover menu or sticky element can shift layout.
+        cdp("Input.dispatchMouseEvent", type="mouseMoved", x=r["x"], y=r["y"])
+        r = js(_CLICK_JS % json.dumps(selector))
     if not r:
         raise RuntimeError(f"click: element not found: {selector!r}")
     if r.get("hidden"):
@@ -194,6 +208,14 @@ def click(selector, timeout=0.0):
         raise RuntimeError(f"click: {selector!r} is covered by <{r['covered']}> at ({r['x']:.0f}, {r['y']:.0f}) -- dismiss it first")
     click_at_xy(r["x"], r["y"])
     return r["x"], r["y"]
+
+def handle_dialog(accept=True, text=None):
+    """Accept or dismiss an open alert/confirm/prompt/beforeunload; `text` answers a prompt().
+    Returns the dialog ({type, message, ...}) or None if none was open."""
+    dialog = _send({"meta": "pending_dialog"}).get("dialog")
+    if dialog:
+        cdp("Page.handleJavaScriptDialog", accept=accept, **({} if text is None else {"promptText": text}))
+    return dialog
 
 def type_text(text):
     cdp("Input.insertText", text=text)
@@ -357,6 +379,21 @@ def new_tab(url="about:blank"):
     if url != "about:blank":
         goto_url(url)
     return tid
+
+def switch_to_new_tab(timeout=5.0):
+    """Switch to a tab the current tab opened (target=_blank link, window.open) and return it.
+    Clicking such a link leaves you on the old tab; call this right after. None on timeout."""
+    me = current_tab()["targetId"]
+    deadline = time.time() + timeout
+    while True:
+        opened = [t for t in cdp("Target.getTargets")["targetInfos"] if t["type"] == "page" and t.get("openerId") == me]
+        if opened:
+            switch_tab(opened[-1]["targetId"])
+            wait_for_load()
+            return current_tab()
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
 
 def close_tab(target=None):
     """Close a tab. If `target` is omitted, closes the currently attached tab.

@@ -370,10 +370,13 @@ def test_press_key_uses_real_virtual_key_codes(key, vk, code):
 
 def test_click_scrolls_and_clicks_element_center():
     clicks = []
-    with patch("browser_harness.helpers.js", return_value={"x": 10, "y": 20, "covered": None}), \
+    moves = []
+    with patch("browser_harness.helpers.js", side_effect=[{"x": 10, "y": 20, "covered": None}, {"x": 10, "y": 15, "covered": None}]), \
+         patch("browser_harness.helpers.cdp", side_effect=lambda m, **kw: moves.append((kw["type"], kw["x"], kw["y"]))), \
          patch("browser_harness.helpers.click_at_xy", side_effect=lambda x, y: clicks.append((x, y))):
-        assert helpers.click("#go") == (10, 20)
-    assert clicks == [(10, 20)]
+        assert helpers.click("#go") == (10, 15)
+    assert moves == [("mouseMoved", 10, 20)]  # hover first, then click where the element is after hover
+    assert clicks == [(10, 15)]
 
 
 @pytest.mark.parametrize("result,msg", [
@@ -381,7 +384,36 @@ def test_click_scrolls_and_clicks_element_center():
 ])
 def test_click_raises_instead_of_clicking_blind(result, msg):
     with patch("browser_harness.helpers.js", return_value=result), \
+         patch("browser_harness.helpers.cdp"), \
          patch("browser_harness.helpers.click_at_xy") as click_at:
         with pytest.raises(RuntimeError, match=msg):
             helpers.click("#go")
     click_at.assert_not_called()
+
+
+def test_handle_dialog_accepts_with_prompt_text():
+    calls = []
+    with patch("browser_harness.helpers._send", return_value={"dialog": {"type": "prompt", "message": "Name?"}}), \
+         patch("browser_harness.helpers.cdp", side_effect=lambda m, **kw: calls.append((m, kw))):
+        assert helpers.handle_dialog(text="Ada")["type"] == "prompt"
+    assert calls == [("Page.handleJavaScriptDialog", {"accept": True, "promptText": "Ada"})]
+
+
+def test_handle_dialog_noop_without_dialog():
+    with patch("browser_harness.helpers._send", return_value={"dialog": None}), \
+         patch("browser_harness.helpers.cdp") as cdp:
+        assert helpers.handle_dialog() is None
+    cdp.assert_not_called()
+
+
+def test_switch_to_new_tab_picks_tab_opened_by_current():
+    targets = {"targetInfos": [
+        {"type": "page", "targetId": "other", "openerId": "x"},
+        {"type": "page", "targetId": "child", "openerId": "me"},
+    ]}
+    with patch("browser_harness.helpers.current_tab", side_effect=[{"targetId": "me"}, {"targetId": "child"}]), \
+         patch("browser_harness.helpers.cdp", return_value=targets), \
+         patch("browser_harness.helpers.switch_tab") as sw, \
+         patch("browser_harness.helpers.wait_for_load"):
+        assert helpers.switch_to_new_tab()["targetId"] == "child"
+    sw.assert_called_once_with("child")

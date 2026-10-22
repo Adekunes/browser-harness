@@ -297,11 +297,41 @@ def test_current_tab_meta_returns_not_attached_when_no_target_id():
 
 def test_enable_default_domains_applies_headless_ua_override():
     d = _fresh_daemon()
-    d.ua = "Mozilla/5.0 Chrome/141.0.0.0"
+    d.ua = {"userAgent": "Mozilla/5.0 Chrome/141.0.0.0"}
     asyncio.run(d._enable_default_domains("s1"))
-    assert ("Network.setUserAgentOverride", {"userAgent": d.ua}, "s1") in d.cdp.calls
+    assert ("Network.setUserAgentOverride", d.ua, "s1") in d.cdp.calls
 
 
 def test_chrome_binary_prefers_bh_chrome_bin(monkeypatch):
     monkeypatch.setenv("BH_CHROME_BIN", "/opt/my/chrome")
     assert daemon.chrome_binary() == "/opt/my/chrome"
+
+
+class _BlockingCDP(_FakeCDP):
+    async def send_raw(self, method, params=None, session_id=None):
+        self.calls.append((method, params, session_id))
+        await asyncio.Event().wait()  # hangs like a CDP call on a page frozen by alert()
+
+
+def _blocked_by_dialog(method):
+    d = daemon.Daemon()
+    d.cdp = _BlockingCDP()
+    d.session = "s1"
+
+    async def go():
+        async def open_dialog():
+            await asyncio.sleep(0.05)
+            d.dialog = {"type": "confirm", "message": "Sure?"}
+            d.dialog_open.set()
+        asyncio.ensure_future(open_dialog())
+        return await d.handle({"method": method, "params": {}})
+    return asyncio.run(go())
+
+
+def test_input_call_returns_once_it_opens_a_dialog():
+    assert _blocked_by_dialog("Input.dispatchMouseEvent") == {"result": {}}
+
+
+def test_other_calls_blocked_by_dialog_get_actionable_error():
+    r = _blocked_by_dialog("Runtime.evaluate")
+    assert "confirm dialog 'Sure?'" in r["error"] and "handle_dialog" in r["error"]

@@ -60,6 +60,8 @@ BU_NAME=agent1 browser-harness --reload
 - Agents with different `BU_NAME`s share nothing: cookies, tabs, and focus are isolated.
 - It also closes on its own after `BH_IDLE_TIMEOUT` seconds without a call (default 1800).
 - `BH_HEADLESS=0` shows the window. `BH_CHROME_BIN` picks the binary if auto-detect fails.
+- `BH_STEALTH=1` patches the fingerprint signals headless still leaks (languages, SwiftShader WebGL). Works in any mode.
+- Orchestrating many agents: see `interaction-skills/parallel-agents.md`.
 
 ## Remote Browsers
 
@@ -107,7 +109,9 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 
 - Screenshots first: use `capture_screenshot()` to understand visible state.
 - Clicking: screenshot -> read pixel -> `click_at_xy(x, y)` -> screenshot again.
-- When you know a selector, `click(selector)` scrolls it into view and clicks its center. It raises if the element is missing, hidden, or covered (cookie banner, modal) instead of clicking blind.
+- When you know a selector, `click(selector)` scrolls it into view and clicks its center. It reaches into open shadow roots and same-origin iframes, and raises if the element is missing, hidden, or covered (cookie banner, modal) instead of clicking blind. `click(selector, timeout=5)` waits for late renders.
+- Links with `target=_blank` and `window.open` leave you on the old tab: call `switch_to_new_tab()` right after the click.
+- If `page_info()` returns `{"dialog": ...}`, call `handle_dialog(accept=True)` (or `False`; `text=` answers a prompt). Every other call errors until you do.
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
@@ -127,6 +131,7 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 - dropdowns.md
 - iframes.md
 - network-requests.md
+- parallel-agents.md
 - print-as-pdf.md
 - profile-sync.md
 - screenshots.md
