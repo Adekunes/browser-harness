@@ -165,10 +165,12 @@ def _needs_chrome_permission_popup(msg):
 
 
 def _is_local_chrome_mode(env=None):
-    """True when the daemon discovers a local Chrome instead of a remote CDP WS."""
+    """True when the daemon discovers a local Chrome instead of a remote CDP WS or a browser it launches."""
     env = env or {}
     return not (
-        env.get("BU_CDP_WS")
+        env.get("BH_LAUNCH_BROWSER") == "1"
+        or os.environ.get("BH_LAUNCH_BROWSER") == "1"
+        or env.get("BU_CDP_WS")
         or env.get("BU_CDP_URL")
         or os.environ.get("BU_CDP_WS")
         or os.environ.get("BU_CDP_URL")

@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, glob, json, os, platform, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -87,7 +87,14 @@ PROFILES = profile_dirs()
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
-BROWSER_KIND = "cloud" if REMOTE_ID else ("cdp" if (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")) else "local")
+LAUNCH = os.environ.get("BH_LAUNCH_BROWSER") == "1"
+BROWSER_KIND = "cloud" if REMOTE_ID else ("cdp" if (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")) else ("launched" if LAUNCH else "local"))
+# Seconds without an IPC request before the daemon exits (and closes a launched browser). 0 = never.
+IDLE_TIMEOUT = float(os.environ.get("BH_IDLE_TIMEOUT") or (1800 if LAUNCH else 0))
+_launched = None  # (Popen, user-data-dir) of the Chrome this daemon owns when BH_LAUNCH_BROWSER=1
+# BH_STEALTH=1 injects stealth.js (patches headless fingerprint tells: languages, SwiftShader WebGL) into every page.
+STEALTH_JS = (Path(__file__).with_name("stealth.js").read_text(encoding="utf-8")
+              if os.environ.get("BH_STEALTH") == "1" else None)
 
 
 def log(msg):
@@ -122,7 +129,77 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
     return None
 
 
+def chrome_binary():
+    if exe := os.environ.get("BH_CHROME_BIN"):
+        return exe
+    for n in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        if exe := shutil.which(n):
+            return exe
+    system = platform.system()
+    if system == "Darwin":
+        cands = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+    elif system == "Windows":
+        cands = [str(Path(os.environ[v]) / "Google/Chrome/Application/chrome.exe") for v in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA") if os.environ.get(v)]
+    else:
+        cands = []
+    pw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or str(Path.home() / ".cache/ms-playwright")
+    cands += sorted(glob.glob(os.path.join(pw, "chromium-*/chrome-linux*/chrome")), reverse=True)
+    return next((c for c in cands if os.path.exists(c)), None)
+
+
+def _die_with_daemon():  # Linux: SIGTERM Chrome if the daemon is SIGKILLed, so no orphan browsers
+    import ctypes
+    ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def launch_browser():
+    """Start a private Chrome (temp profile, free port) owned by this daemon; return its WS URL."""
+    global _launched
+    exe = chrome_binary()
+    if not exe:
+        raise RuntimeError("BH_LAUNCH_BROWSER=1 but no Chrome/Chromium found -- set BH_CHROME_BIN=/path/to/chrome")
+    data_dir = tempfile.mkdtemp(prefix=f"bh-chrome-{NAME}-")
+    args = [exe, f"--user-data-dir={data_dir}", "--remote-debugging-port=0", "--no-first-run",
+            "--no-default-browser-check", "--disable-background-networking", "--disable-blink-features=AutomationControlled",
+            "--window-size=1280,800"]
+    if os.environ.get("BH_HEADLESS", "1") != "0":
+        args.append("--headless=new")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.append("--no-sandbox")  # Chrome refuses to start as root without it (containers)
+    proc = subprocess.Popen(args + ["about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            preexec_fn=_die_with_daemon if sys.platform.startswith("linux") else None)
+    _launched = (proc, data_dir)
+    log(f"launched {exe} pid={proc.pid} profile={data_dir}")
+    active = Path(data_dir) / "DevToolsActivePort"
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"{exe} exited with code {proc.returncode} before CDP came up")
+        try:
+            port, ws_path = active.read_text(encoding="utf-8").splitlines()[:2]
+            return f"ws://127.0.0.1:{port}{ws_path}"
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.1)
+    raise RuntimeError(f"{exe} did not expose CDP within 30s")
+
+
+def stop_launched():
+    if not _launched:
+        return
+    proc, data_dir = _launched
+    proc.terminate()
+    try:
+        proc.wait(5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(5)
+    shutil.rmtree(data_dir, ignore_errors=True)
+    log(f"closed launched browser pid={proc.pid}")
+
+
 def get_ws_url():
+    if LAUNCH:
+        return launch_browser()
     if url := os.environ.get("BU_CDP_WS"):
         return url
     if url := os.environ.get("BU_CDP_URL"):
@@ -217,6 +294,9 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        self.ua = None  # Network.setUserAgentOverride params for headless launched browsers (drops "HeadlessChrome")
+        self.dialog_open = asyncio.Event()
+        self.last_request = time.time()
 
     async def attach_first_page(self):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -257,7 +337,12 @@ class Daemon:
                 )
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
-        await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+        tasks = [enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")]
+        if STEALTH_JS:
+            tasks.append(_silent(self.cdp.send_raw("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS}, session_id=session_id)))
+        if self.ua:
+            tasks.append(_silent(self.cdp.send_raw("Network.setUserAgentOverride", self.ua, session_id=session_id)))
+        await asyncio.gather(*tasks)
 
     async def start(self):
         self.stop = asyncio.Event()
@@ -274,6 +359,21 @@ class Daemon:
                     "If you use Browser Use cloud, verify auth and get a fresh URL via start_remote_daemon()."
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
+        if LAUNCH:
+            v = await self.cdp.send_raw("Browser.getVersion")
+            if "HeadlessChrome/" in v["userAgent"]:
+                full = v["product"].split("/")[-1]
+                brands = [{"brand": "Chromium", "version": full.split(".")[0]}, {"brand": "Not)A;Brand", "version": "24"}]
+                self.ua = {
+                    "userAgent": v["userAgent"].replace("HeadlessChrome/", "Chrome/"),
+                    # Without metadata the override empties navigator.userAgentData.brands, a strong tell.
+                    "userAgentMetadata": {
+                        "brands": brands, "fullVersionList": [{**b, "version": full} if b["brand"] == "Chromium" else b for b in brands],
+                        "platform": {"Darwin": "macOS", "Windows": "Windows"}.get(platform.system(), "Linux"),
+                        "platformVersion": "", "model": "", "mobile": False,
+                        "architecture": "arm" if platform.machine().lower() in ("arm64", "aarch64") else "x86",
+                    },
+                }
         await self.attach_first_page()
         orig = self.cdp._event_registry.handle_event
         mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
@@ -281,12 +381,30 @@ class Daemon:
             self.events.append({"method": method, "params": params, "session_id": session_id})
             if method == "Page.javascriptDialogOpening":
                 self.dialog = params
+                self.dialog_open.set()
             elif method == "Page.javascriptDialogClosed":
                 self.dialog = None
+                self.dialog_open.clear()
             elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
                 asyncio.create_task(_silent(asyncio.wait_for(self.cdp.send_raw("Runtime.evaluate", {"expression": mark_js}, session_id=self.session), timeout=2)))
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
+
+    async def send_unless_dialog(self, method, params, session_id):
+        """send_raw, but give up ~1s after a JS dialog opens: the page is frozen and the
+        call would otherwise hang until the dialog closes. Returns None when blocked."""
+        call = asyncio.ensure_future(self.cdp.send_raw(method, params, session_id=session_id))
+        opened = asyncio.ensure_future(self.dialog_open.wait())
+        try:
+            await asyncio.wait({call, opened}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            opened.cancel()
+        if not call.done():
+            await asyncio.wait({call}, timeout=1)
+        if call.done():
+            return call.result()
+        call.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return None
 
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
@@ -295,6 +413,7 @@ class Daemon:
         expected = ipc.expected_token()
         if expected is not None and req.get("token") != expected:
             return {"error": "unauthorized"}
+        self.last_request = time.time()
         meta = req.get("meta")
         # Liveness probe — lets clients confirm the listener is actually this
         # daemon and not an unrelated process that reused our port post-crash.
@@ -376,7 +495,14 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.send_unless_dialog(method, params, sid)
+            if result is not None:
+                return {"result": result}
+            if method.startswith("Input."):  # the input landed; it is what opened the dialog
+                return {"result": {}}
+            d = self.dialog or {}
+            return {"error": f"blocked by an open JavaScript {d.get('type', '')} dialog {d.get('message', '')!r} -- "
+                             "call handle_dialog(accept=True) or handle_dialog(accept=False) first"}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid == self.session and sid:
@@ -406,17 +532,25 @@ async def serve(d):
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    idle_task = asyncio.create_task(_idle_watch(d)) if IDLE_TIMEOUT > 0 else None
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
-        for t in (serve_task, stop_task):
+        for t in filter(None, (serve_task, stop_task, idle_task)):
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass
         ipc.cleanup_endpoint(NAME)
+
+
+async def _idle_watch(d):
+    while time.time() - d.last_request < IDLE_TIMEOUT:
+        await asyncio.sleep(min(IDLE_TIMEOUT, 30))
+    log(f"idle for {IDLE_TIMEOUT:.0f}s, shutting down")
+    d.stop.set()
 
 
 async def main():
@@ -437,6 +571,8 @@ if __name__ == "__main__":
         sys.exit(0)
     open(LOG, "w").close()
     open(PID, "w").write(str(os.getpid()))
+    if LAUNCH:  # turn SIGTERM into a normal exit so the finally below closes the launched Chrome
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -446,5 +582,6 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         stop_remote()
+        stop_launched()
         try: os.unlink(PID)
         except FileNotFoundError: pass

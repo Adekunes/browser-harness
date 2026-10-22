@@ -14,6 +14,13 @@ print(current_tab())
 print(page_info())
 ```
 
+Links with `target=_blank` and `window.open()` open a new tab but leave the harness attached to the old one. Follow it:
+
+```python
+click("a[target=_blank]")
+print(switch_to_new_tab())            # waits up to 5s for a tab whose opener is the current tab
+```
+
 What CDP is good at:
 - attach to a tab
 - open a tab

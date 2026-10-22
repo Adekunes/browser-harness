@@ -13,6 +13,7 @@ for _stream in (sys.stdout, sys.stderr):
 from .admin import (
     _version,
     NAME,
+    browser_connections,
     daemon_alive,
     daemon_browser_kind,
     ensure_daemon,
@@ -55,6 +56,8 @@ Commands:
   browser-harness telemetry status    show anonymous telemetry opt-out state
   browser-harness --update [-y]    pull the latest version (agents: pass -y)
   browser-harness --reload         stop the daemon so next call picks up code changes
+                                   (with BH_LAUNCH_BROWSER, also closes that Chrome)
+  browser-harness list             live daemons (BU_NAME, url, title), one per line
 """
 
 USAGE = """Usage:
@@ -82,7 +85,7 @@ def _local_chrome_listening():
 # env with a cloud WebSocket URL, silently replacing the user's explicit endpoint
 # *and* billing them for a cloud browser they never asked for.
 def _explicit_cdp_configured():
-    return bool(os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS"))
+    return bool(os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BH_LAUNCH_BROWSER") == "1")
 
 
 def _cloud_auth_configured():
@@ -115,7 +118,7 @@ def _telemetry_command(args):
         return "reload"
     if first == "--debug-clicks":
         return "debug-clicks"
-    if first in {"auth", "skill", "telemetry"}:
+    if first in {"auth", "skill", "telemetry", "list"}:
         return first
     return "usage"
 
@@ -316,6 +319,11 @@ def _run(args):
     if args and args[0] == "--reload":
         restart_daemon()
         print("daemon stopped — will restart fresh on next call")
+        return
+    if args and args[0] == "list":
+        for c in browser_connections():
+            page = c["page"] or {}
+            print(f"{c['name']}\t{page.get('url', '')}\t{page.get('title', '')}")
         return
     if args and args[0] == "--debug-clicks":
         os.environ["BH_DEBUG_CLICKS"] = "1"

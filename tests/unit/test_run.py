@@ -252,3 +252,15 @@ def test_cli_doctor_rejects_unknown_flags():
             run.main()
     assert ei.value.code == 2
     assert "usage" in err.getvalue().lower()
+
+
+def test_list_prints_live_daemons_without_starting_one():
+    stdout = StringIO()
+    conns = [{"name": "agent1", "page": {"url": "https://a.test/", "title": "A"}}, {"name": "agent2", "page": None}]
+    with patch.object(sys, "argv", ["browser-harness", "list"]), \
+         patch("browser_harness.run.browser_connections", return_value=conns), \
+         patch("browser_harness.run.ensure_daemon") as ensure, \
+         patch("sys.stdout", stdout):
+        run.main()
+    assert stdout.getvalue().splitlines() == ["agent1\thttps://a.test/\tA", "agent2\t\t"]
+    ensure.assert_not_called()
