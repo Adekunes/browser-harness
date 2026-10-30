@@ -1,5 +1,8 @@
 import asyncio
+import json
 import os
+import socket
+from pathlib import Path
 
 import pytest
 
@@ -674,7 +677,7 @@ def test_shutdown_closes_only_the_daemon_owned_tab(monkeypatch):
     monkeypatch.setattr(daemon, "Daemon", lambda: d)
     monkeypatch.setattr(daemon.ipc, "serve", wait_forever)
     monkeypatch.setattr(daemon.ipc, "sock_addr", lambda _name: "test-socket")
-    monkeypatch.setattr(daemon.ipc, "cleanup_endpoint", lambda _name: None)
+    monkeypatch.setattr(daemon.ipc, "release_endpoint", lambda _name: None)
     monkeypatch.setattr(daemon, "log", lambda _message: None)
 
     asyncio.run(daemon.main())
@@ -845,3 +848,108 @@ def test_explicit_stale_session_is_not_redirected():
     assert d.cdp.calls == [
         ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
     ]
+
+
+posix_only = pytest.mark.skipif(daemon.ipc.IS_WINDOWS, reason="AF_UNIX path semantics")
+
+
+@posix_only
+def test_superseded_daemon_leaves_new_owner_socket_and_pid_record(monkeypatch):
+    """A sibling rebinds the path and publishes itself; the old daemon must step
+    aside without deleting either, or the new daemon is alive but unreachable."""
+    monkeypatch.setattr(daemon, "log", lambda _message: None)
+    monkeypatch.setattr(daemon.ipc, "_bound_id", None)
+    path = daemon.ipc._sock_path(daemon.NAME)
+    record = json.dumps({"pid": os.getpid() + 1, "started": "new owner"})
+    new_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    d = daemon.Daemon()
+
+    async def takeover():
+        d.stop = asyncio.Event()
+        serving = asyncio.create_task(daemon.serve(d))
+        await asyncio.sleep(0.1)  # bound and published
+        assert daemon._pid_record_owner() == os.getpid()
+        # Same sequence as ipc.serve() and _publish_own_pid() in the new daemon.
+        os.unlink(path)
+        new_owner.bind(str(path))
+        new_owner.listen()
+        Path(daemon.PID).write_text(record)
+        await asyncio.wait_for(daemon._exit_when_superseded(d, every=0.01), 5)
+        await asyncio.wait_for(serving, 5)
+
+    try:
+        asyncio.run(takeover())
+        daemon._release_pid_record()
+
+        assert Path(daemon.PID).read_text() == record
+        client, _token = daemon.ipc.connect(daemon.NAME)
+        client.close()
+    finally:
+        new_owner.close()
+        path.unlink(missing_ok=True)
+        Path(daemon.PID).unlink(missing_ok=True)
+
+
+@posix_only
+def test_daemon_removes_own_socket_and_pid_record_on_normal_exit(monkeypatch):
+    monkeypatch.setattr(daemon, "log", lambda _message: None)
+    monkeypatch.setattr(daemon.ipc, "_bound_id", None)
+    path = daemon.ipc._sock_path(daemon.NAME)
+    d = daemon.Daemon()
+
+    async def run():
+        d.stop = asyncio.Event()
+        serving = asyncio.create_task(daemon.serve(d))
+        await asyncio.sleep(0.1)
+        assert path.exists()
+        d.stop.set()
+        await asyncio.wait_for(serving, 5)
+
+    asyncio.run(run())
+    daemon._release_pid_record()
+
+    assert not path.exists()
+    assert not Path(daemon.PID).exists()
+
+
+def test_daemon_that_lost_the_socket_does_not_claim_the_pid_record(monkeypatch):
+    """Publishing here would make the real owner exit as superseded, leaving this
+    process alive with no socket."""
+    monkeypatch.setattr(daemon, "log", lambda _message: None)
+    monkeypatch.setattr(daemon.ipc, "owns_endpoint", lambda _name: False)
+    monkeypatch.setattr(daemon.ipc, "release_endpoint", lambda _name: None)
+
+    async def wait_forever(*_args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(daemon.ipc, "serve", wait_forever)
+    record = json.dumps({"pid": os.getpid() + 1, "started": "new owner"})
+    Path(daemon.PID).write_text(record)
+    d = daemon.Daemon()
+
+    async def run():
+        d.stop = asyncio.Event()
+        serving = asyncio.create_task(daemon.serve(d))
+        await asyncio.sleep(0.1)
+        d.stop.set()
+        await asyncio.wait_for(serving, 5)
+
+    try:
+        asyncio.run(run())
+        assert Path(daemon.PID).read_text() == record
+    finally:
+        Path(daemon.PID).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("content", ["", "not a pid", '{"pid": "x"}'])
+def test_release_pid_record_leaves_unreadable_record(tmp_path, content):
+    pid_file = tmp_path / "daemon.pid"
+    pid_file.write_text(content)
+
+    daemon._release_pid_record(pid_file, pid=4321)
+
+    assert pid_file.read_text() == content
+
+
+def test_release_pid_record_tolerates_missing_record(tmp_path):
+    daemon._release_pid_record(tmp_path / "daemon.pid", pid=4321)

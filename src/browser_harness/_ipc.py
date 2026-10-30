@@ -30,6 +30,9 @@ _NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 # otherwise issue CDP commands). Stays None on POSIX where AF_UNIX + chmod 600
 # is the boundary.
 _server_token = None
+# Set by serve() on POSIX: (st_dev, st_ino) of the socket this process bound.
+# A sibling that rebinds the path gets a new inode, so this tells them apart.
+_bound_id = None
 
 
 def _check(name):  # path-traversal guard for BU_NAME
@@ -164,7 +167,7 @@ def identify(name, timeout=1.0):
 
 async def serve(name, handler):
     """Run the server until cancelled. handler(reader, writer) sees the same interface either way."""
-    global _server_token
+    global _server_token, _bound_id
     if not IS_WINDOWS:
         path = str(_sock_path(name))
         if os.path.exists(path): os.unlink(path)
@@ -172,6 +175,8 @@ async def serve(name, handler):
         old_umask = os.umask(0o077)
         try: server = await asyncio.start_unix_server(handler, path=path)
         finally: os.umask(old_umask)
+        st = os.stat(path)
+        _bound_id = (st.st_dev, st.st_ino)
         _server_token = None
         async with server: await asyncio.Event().wait()
         return
@@ -186,8 +191,7 @@ async def serve(name, handler):
     try:
         async with server: await asyncio.Event().wait()
     finally:
-        try: pf.unlink()
-        except FileNotFoundError: pass
+        release_endpoint(name)
 
 
 def expected_token():
@@ -199,3 +203,19 @@ def cleanup_endpoint(name):  # best-effort; silent if already gone
     p = _sock_path(name) if not IS_WINDOWS else port_path(name)
     try: p.unlink()
     except FileNotFoundError: pass
+
+
+def owns_endpoint(name):
+    """True while the endpoint for `name` is still the one this process's serve() bound."""
+    if IS_WINDOWS:
+        return _server_token is not None and _read_port_file(name)[1] == _server_token
+    try: st = os.stat(_sock_path(name))
+    except OSError: return False
+    return (st.st_dev, st.st_ino) == _bound_id
+
+
+def release_endpoint(name):
+    """Daemon-exit cleanup. A newer daemon may have rebound the path since serve()
+    ran, and that endpoint is not ours to remove. cleanup_endpoint() stays
+    unconditional for admin callers clearing a daemon they already stopped."""
+    if owns_endpoint(name): cleanup_endpoint(name)

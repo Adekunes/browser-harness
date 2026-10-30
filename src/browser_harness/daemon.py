@@ -99,6 +99,26 @@ def _publish_own_pid(path=PID, pid=None):
     os.replace(tmp, target)
 
 
+def _pid_record_owner(path=PID):
+    """PID named by the record, or None when it is missing or unreadable."""
+    try:
+        raw = Path(path).read_text()
+        try:
+            return int(json.loads(raw)["pid"])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            return int(raw.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _release_pid_record(path=PID, pid=None):
+    """Daemon-exit cleanup: remove the record only while it still names this
+    process. Once superseded, the record belongs to the newer daemon."""
+    if _pid_record_owner(path) == (pid or os.getpid()):
+        try: os.unlink(path)
+        except FileNotFoundError: pass
+
+
 def profile_dirs(system=None):
     system = system or platform.system()
     if system == "Windows":
@@ -671,7 +691,12 @@ class Daemon:
     async def _connect_cdp(self):
         """Build the CDP client, connect the websocket, attach a page, and install
         the event tap. Shared by initial start() and reconnect()."""
-        url = get_ws_url()
+        # get_ws_url() polls /json/version with blocking urlopen + time.sleep for
+        # up to 30 s. Run it off the event loop so meta:ping keeps answering while
+        # Chrome is down or slow to start; otherwise ensure_daemon() reads the
+        # silence as "no daemon", spawns a sibling without signalling this one,
+        # and this process is left running forever on an unlinked socket.
+        url = await asyncio.to_thread(get_ws_url)
         log(f"connecting to {_safe_connection_label(url)}")
         self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
         if BROWSER_KIND == "local":
@@ -899,6 +924,10 @@ async def serve(d):
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
+    # The socket is ours now, so the pid record must say so (see _exit_when_superseded).
+    # A sibling may have rebound it during that sleep: claiming the record then would
+    # make the real owner step aside and leave this process with no socket at all.
+    if ipc.owns_endpoint(NAME): _publish_own_pid()
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -930,13 +959,37 @@ async def serve(d):
                             log(f"close dedicated tab on shutdown: {e}")
         else:
             log("skip dedicated-tab cleanup: stale-session recovery did not stop")
-        ipc.cleanup_endpoint(NAME)
+        ipc.release_endpoint(NAME)
+
+
+async def _exit_when_superseded(d, every=5.0):
+    """Stop this daemon once another process owns NAME.
+
+    ipc.serve() unlinks and rebinds the socket path unconditionally, so a
+    sibling that starts while this daemon is busy takes the name over silently
+    and this process becomes unreachable but never exits. The pid record is
+    the ownership ledger: the moment it names another live pid, step aside."""
+    me = os.getpid()
+    while not d.stop.is_set():
+        await asyncio.sleep(every)
+        owner = _pid_record_owner()
+        if owner is None:
+            continue  # no record: a --reload in progress, let it finish
+        if owner != me:
+            log(f"superseded by pid {owner}, exiting")
+            d._shutting_down = True
+            d.stop.set()
+            return
 
 
 async def main():
     d = Daemon()
     await d.start()
-    await serve(d)
+    watchdog = asyncio.create_task(_exit_when_superseded(d))
+    try:
+        await serve(d)
+    finally:
+        watchdog.cancel()
 
 
 def already_running():
@@ -960,5 +1013,4 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         stop_remote()
-        try: os.unlink(PID)
-        except FileNotFoundError: pass
+        _release_pid_record()

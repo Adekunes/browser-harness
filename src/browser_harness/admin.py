@@ -564,29 +564,31 @@ def ensure_daemon(wait=None, name=None, env=None):
             stderr_sink = open(ipc.log_path(name or NAME), "ab")
         except OSError:
             stderr_sink = subprocess.DEVNULL
-        if local:
-            with _spawn_lock(name, timeout=startup_wait) as lock:
-                if lock.fd is None:
-                    raise RuntimeError("daemon-starting: another browser-harness daemon is still starting; retry later")
-                if daemon_alive(name):
-                    if stderr_sink is not subprocess.DEVNULL:
-                        stderr_sink.close()
-                    return
-                pending_pid = _parked_daemon_pid(name) or _starting_daemon_pid(name)
-                if pending_pid:
-                    p = None
-                else:
-                    p = subprocess.Popen(
-                        [sys.executable, "-m", "browser_harness.daemon"],
-                        env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
-                    )
-                    _publish_pid(ipc.pid_path(name or NAME), p.pid)
-                    pending_pid = p.pid
-        else:
-            p = subprocess.Popen(
-                [sys.executable, "-m", "browser_harness.daemon"],
-                env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
-            )
+        # One spawner at a time for EVERY browser kind. This used to apply to local
+        # Chrome only; a BU_CDP_URL daemon (every `bh-as` run) was spawned with no
+        # lock and no pending-pid check, so two runs on one identity a few seconds
+        # apart each started a daemon. The daemon's own already_running() ping
+        # cannot catch that: a cold daemon only answers after its CDP connect has
+        # finished, seconds later. The later sibling then unlinked and rebound the
+        # socket path and the earlier one lived on unreachable (41 daemons found on
+        # 2026-10-15, 27 of them orphans).
+        with _spawn_lock(name, timeout=startup_wait) as lock:
+            if lock.fd is None:
+                raise RuntimeError("daemon-starting: another browser-harness daemon is still starting; retry later")
+            if daemon_alive(name):
+                if stderr_sink is not subprocess.DEVNULL:
+                    stderr_sink.close()
+                return
+            pending_pid = (_parked_daemon_pid(name) if local else None) or _starting_daemon_pid(name)
+            if pending_pid:
+                p = None
+            else:
+                p = subprocess.Popen(
+                    [sys.executable, "-m", "browser_harness.daemon"],
+                    env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
+                )
+                _publish_pid(ipc.pid_path(name or NAME), p.pid)
+                pending_pid = p.pid
         if stderr_sink is not subprocess.DEVNULL:
             stderr_sink.close()
         spawned = time.monotonic()
